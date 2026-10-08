@@ -22,7 +22,16 @@ get_tun_iface() {
     ip link | awk -F': ' '/ tun[[:alnum:]]+/ {print $2; exit}'
 }
 get_hot_iface() {
-    ip link | awk -F': ' '/(^| )(swlan[[:alnum:]_]*|softap[[:alnum:]_]*|p2p-wlan[[:alnum:]_]*|ap[[:alnum:]_]*)\:/ {print $2; exit}' | cut -d'@' -f1 | head -n1
+    for iface in $(ip link | awk -F': ' '/^[0-9]+:/ {print $2}' | cut -d'@' -f1); do
+        case "$iface" in
+            swlan*|softap*|p2p-wlan*|ap[0-9]*|wlan[0-9]*)
+                [ "$iface" = "wlan0" ] && continue
+                [ -n "$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet /{print $2; exit}')" ] || continue
+                echo "$iface"
+                return
+                ;;
+        esac
+    done
 }
 get_usb_iface() {
     ip link | awk -F': ' '/(^| )(usb[[:alnum:]_]*|rndis[[:alnum:]_]*|eth[[:alnum:]_]*)\:/ {print $2; exit}' | cut -d'@' -f1 | head -n1
