@@ -56,7 +56,7 @@ while true; do
     
     # 检查进程是否已经在运行
     if pgrep -f "${EASYTIER}" >/dev/null; then
-        sleep 10s
+        sleep 2s
         continue
     fi
     
@@ -108,5 +108,5 @@ while true; do
         update_module_description "主程序启动失败，请检查配置文件或启动参数"
     fi
     
-    sleep 10s
+    sleep 2s
 done
