@@ -41,7 +41,10 @@ while true; do
         continue
     fi
 
-    echo "[ET] route changed: '$last' -> '$cur' ($(date))" >> "$LOG_FILE"
+    echo "[ET] route changed ($(date))" >> "$LOG_FILE"
+    echo "  old: $last" >> "$LOG_FILE"
+    echo "  new: $cur" >> "$LOG_FILE"
+    ip route get 8.8.8.8 2>/dev/null | grep -m1 ' dev ' >> "$LOG_FILE"
     pkill -f "$EASYTIER"
     last="$cur"
     was_down=0
