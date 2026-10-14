@@ -121,6 +121,7 @@ const FORM_MANAGED_TOML_FIELDS: &[&str] = &[
     "ipv6_public_addr_auto",
     "ipv6_public_addr_prefix",
     "dhcp",
+    "dhcpv6",
     "network_identity",
     "listeners",
     "mapped_listeners",
@@ -250,7 +251,18 @@ impl NetworkConfigExt for NetworkConfig {
                 .with_context(|| format!("failed to parse instance id: {:?}", self.instance_id))?,
         );
         cfg.set_hostname(self.hostname.clone());
-        cfg.set_dhcp(self.dhcp.unwrap_or_default());
+        cfg.set_dhcp(self.dhcp.unwrap_or(self.dhcp_ipv4_cidr.is_some()));
+        if cfg.get_dhcp()
+            && let Some(cidr) = &self.dhcp_ipv4_cidr
+        {
+            cfg.set_dhcp_config(super::DhcpConfig::from_cidr(cidr)?);
+        }
+        cfg.set_dhcpv6(self.dhcpv6.unwrap_or(self.dhcp_ipv6_cidr.is_some()));
+        if cfg.get_dhcpv6()
+            && let Some(cidr) = &self.dhcp_ipv6_cidr
+        {
+            cfg.set_dhcpv6_config(super::DhcpConfig::from_cidr(cidr)?);
+        }
         cfg.set_inst_name(self.network_name.clone().unwrap_or_default());
 
         // The web UI does not expose credential inputs directly, but imported/saved
@@ -551,6 +563,12 @@ impl NetworkConfigExt for NetworkConfig {
         }
 
         result.dhcp = Some(config.get_dhcp());
+        result.dhcp_ipv4_cidr = config.get_dhcp_config().cidr().map(|cidr| cidr.to_string());
+        result.dhcpv6 = Some(config.get_dhcpv6());
+        result.dhcp_ipv6_cidr = config
+            .get_dhcpv6_config()
+            .cidr()
+            .map(|cidr| cidr.to_string());
 
         let network_identity = config.get_network_identity();
         result.network_name = Some(network_identity.network_name.clone());
@@ -697,6 +715,83 @@ mod tests {
         NetworkConfig {
             networking_method: Some(NetworkingMethod::Standalone as i32),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dhcp_cidr_survives_api_and_toml_round_trips() {
+        let mut input = standalone_config();
+        input.dhcp_ipv4_cidr = Some("192.168.100.0/24".to_owned());
+        for enabled in [None, Some(true), Some(false)] {
+            input.dhcp = enabled;
+            let config = input.gen_config().unwrap();
+            assert_eq!(config.get_dhcp(), enabled.unwrap_or(true));
+            let readback = NetworkConfig::new_from_config(config.clone()).unwrap();
+            let expected_cidr = if enabled == Some(false) {
+                None
+            } else {
+                input.dhcp_ipv4_cidr.clone()
+            };
+            assert_eq!(readback.dhcp_ipv4_cidr, expected_cidr);
+            assert_eq!(
+                TomlConfigLoader::new_from_str(&config.dump())
+                    .unwrap()
+                    .get_dhcp_config(),
+                readback.gen_config().unwrap().get_dhcp_config()
+            );
+            #[cfg(feature = "web-client")]
+            assert_eq!(
+                super::super::api::network_config_from_toml(&config).dhcp_ipv4_cidr,
+                expected_cidr
+            );
+        }
+    }
+
+    #[test]
+    fn dhcpv6_cidr_survives_management_round_trips() {
+        let mut input = NetworkConfig {
+            dhcp: Some(true),
+            dhcp_ipv6_cidr: Some("fd12::/64".to_owned()),
+            ..standalone_config()
+        };
+        for enabled in [None, Some(true), Some(false)] {
+            input.dhcpv6 = enabled;
+            let config = input.gen_config().unwrap();
+            assert_eq!(config.get_dhcpv6(), enabled.unwrap_or(true));
+            let readback = NetworkConfig::new_from_config(&config).unwrap();
+            assert_eq!(readback.dhcpv6, Some(enabled.unwrap_or(true)));
+            assert_eq!(
+                readback.dhcp_ipv6_cidr,
+                if enabled == Some(false) {
+                    None
+                } else {
+                    input.dhcp_ipv6_cidr.clone()
+                }
+            );
+            assert_eq!(
+                readback.gen_config().unwrap().get_dhcpv6_config(),
+                config.get_dhcpv6_config()
+            );
+            assert_eq!(
+                super::super::api::network_config_from_toml(&config).dhcp_ipv6_cidr,
+                readback.dhcp_ipv6_cidr
+            );
+        }
+    }
+
+    #[test]
+    fn dhcp_api_rejects_invalid_or_unusable_subnets() {
+        let mut input = standalone_config();
+        for value in [
+            "true",
+            "false",
+            "yes",
+            "::/64",
+            "192.168.100.0/31",
+            "192.168.100.1/32",
+        ] {
+            input.dhcp_ipv4_cidr = Some(value.to_owned());
+            assert!(input.gen_config().is_err(), "accepted {value}");
         }
     }
 

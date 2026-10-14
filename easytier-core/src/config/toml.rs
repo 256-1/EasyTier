@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use super::normalize_secure_mode_config;
+use super::{DhcpConfig, normalize_secure_mode_config};
 pub use super::{EncryptionAlgorithm, gateway::PortForwardConfig};
 use anyhow::Context;
 #[cfg(feature = "rich-config-errors")]
@@ -53,8 +53,27 @@ pub trait ConfigLoader: Send + Sync {
     fn get_ipv6_public_addr_prefix(&self) -> Option<cidr::Ipv6Cidr>;
     fn set_ipv6_public_addr_prefix(&self, prefix: Option<cidr::Ipv6Cidr>);
 
-    fn get_dhcp(&self) -> bool;
-    fn set_dhcp(&self, dhcp: bool);
+    fn get_dhcp_config(&self) -> DhcpConfig;
+    fn set_dhcp_config(&self, dhcp: DhcpConfig);
+
+    fn get_dhcp(&self) -> bool {
+        self.get_dhcp_config().enabled()
+    }
+
+    fn set_dhcp(&self, dhcp: bool) {
+        self.set_dhcp_config(DhcpConfig::Enabled(dhcp));
+    }
+
+    fn get_dhcpv6_config(&self) -> DhcpConfig<cidr::Ipv6Cidr>;
+    fn set_dhcpv6_config(&self, dhcp: DhcpConfig<cidr::Ipv6Cidr>);
+
+    fn get_dhcpv6(&self) -> bool {
+        self.get_dhcpv6_config().enabled()
+    }
+
+    fn set_dhcpv6(&self, dhcp: bool) {
+        self.set_dhcpv6_config(DhcpConfig::Enabled(dhcp));
+    }
 
     fn add_proxy_cidr(
         &self,
@@ -397,7 +416,8 @@ struct Config {
     ipv6_public_addr_provider: Option<bool>,
     ipv6_public_addr_auto: Option<bool>,
     ipv6_public_addr_prefix: Option<String>,
-    dhcp: Option<bool>,
+    dhcp: Option<DhcpConfig>,
+    dhcpv6: Option<DhcpConfig<cidr::Ipv6Cidr>>,
     network_identity: Option<NetworkIdentity>,
     listeners: Option<Vec<url::Url>>,
     mapped_listeners: Option<Vec<url::Url>>,
@@ -725,12 +745,20 @@ impl ConfigLoader for TomlConfig {
             prefix.map(|prefix| prefix.to_string());
     }
 
-    fn get_dhcp(&self) -> bool {
+    fn get_dhcp_config(&self) -> DhcpConfig {
         self.config.lock().unwrap().dhcp.unwrap_or_default()
     }
 
-    fn set_dhcp(&self, dhcp: bool) {
+    fn set_dhcp_config(&self, dhcp: DhcpConfig) {
         self.config.lock().unwrap().dhcp = Some(dhcp);
+    }
+
+    fn get_dhcpv6_config(&self) -> DhcpConfig<cidr::Ipv6Cidr> {
+        self.config.lock().unwrap().dhcpv6.unwrap_or_default()
+    }
+
+    fn set_dhcpv6_config(&self, dhcp: DhcpConfig<cidr::Ipv6Cidr>) {
+        self.config.lock().unwrap().dhcpv6 = Some(dhcp);
     }
 
     fn add_proxy_cidr(
@@ -1066,19 +1094,113 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_error_preserves_source_and_location() {
-        let error =
-            TomlConfig::new_from_str_with_source("fixture.toml", "dhcp = \"yes\"").unwrap_err();
-        let display = error.to_string();
+    fn dhcp_accepts_booleans_and_ipv4_subnets() {
+        assert!(!TomlConfig::default().get_dhcp());
+        for (value, expected) in [
+            ("false", DhcpConfig::Enabled(false)),
+            ("true", DhcpConfig::Enabled(true)),
+            (
+                "'192.168.100.0/24'",
+                DhcpConfig::Cidr("192.168.100.0/24".parse().unwrap()),
+            ),
+            (
+                "'192.168.100.0/30'",
+                DhcpConfig::Cidr("192.168.100.0/30".parse().unwrap()),
+            ),
+            (
+                "'0.0.0.0/0'",
+                DhcpConfig::Cidr("0.0.0.0/0".parse().unwrap()),
+            ),
+        ] {
+            let config = TomlConfig::new_from_str(&format!("dhcp = {value}")).unwrap();
+            assert_eq!(config.get_dhcp_config(), expected);
+            assert_eq!(config.get_dhcp(), expected.enabled());
+            #[cfg(feature = "config-write")]
+            assert_eq!(
+                TomlConfig::new_from_str(&config.dump())
+                    .unwrap()
+                    .get_dhcp_config(),
+                expected
+            );
+            config.set_dhcp(false);
+            assert_eq!(config.get_dhcp_config(), DhcpConfig::Enabled(false));
+        }
+    }
 
-        assert!(display.contains("fixture.toml"));
-        assert!(display.contains("dhcp = \"yes\""));
-        assert!(display.contains("invalid type: string"));
-        assert!(
-            error
-                .chain()
-                .any(|cause| cause.downcast_ref::<toml::de::Error>().is_some())
-        );
+    #[test]
+    fn dhcpv6_config_round_trip_and_validation() {
+        assert!(!TomlConfig::default().get_dhcpv6());
+        for value in [
+            "true",
+            "false",
+            "'fd12:3456::/64'",
+            "'fd12::/126'",
+            "'2001:db8::/48'",
+        ] {
+            let config =
+                TomlConfig::new_from_str(&format!("dhcp = true\ndhcpv6 = {value}")).unwrap();
+            let exported = config.dump();
+            let restored = TomlConfig::new_from_str(&exported).unwrap();
+            assert_eq!(restored.get_dhcpv6_config(), config.get_dhcpv6_config());
+            assert!(restored.get_dhcp());
+            assert!(exported.contains("dhcp = true"));
+        }
+        for value in [
+            "yes",
+            "10.0.0.0/24",
+            "fd12::1/64",
+            "fd12::/127",
+            "fd12::/128",
+            "::/0",
+            "::/64",
+            "fe80::/64",
+            "ff00::/8",
+        ] {
+            assert!(
+                TomlConfig::new_from_str(&format!("dhcpv6 = '{value}'")).is_err(),
+                "accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn dhcp_rejects_invalid_or_unusable_subnets() {
+        for value in [
+            "'yes'",
+            "'true'",
+            "'::/64'",
+            "'192.168.100.0/31'",
+            "'192.168.100.1/32'",
+            "'192.168.100.1/24'",
+            "'192.168.100.0/33'",
+            "'192.168.100.1'",
+            "123",
+            "{}",
+            "[]",
+        ] {
+            assert!(
+                TomlConfig::new_from_str(&format!("dhcp = {value}")).is_err(),
+                "accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_error_preserves_source_and_location() {
+        for field in ["dhcp", "dhcpv6"] {
+            let input = format!("{field} = \"yes\"");
+            let error = TomlConfig::new_from_str_with_source("fixture.toml", &input).unwrap_err();
+            let display = error.to_string();
+
+            assert!(display.contains("fixture.toml"));
+            assert!(display.contains(&input));
+            assert!(display.contains("invalid DHCP CIDR"));
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.downcast_ref::<toml::de::Error>().is_some())
+            );
+        }
     }
 
     #[cfg(feature = "config-write")]
@@ -1884,13 +2006,16 @@ mod diagnostic_compatibility_tests {
 
     #[test]
     fn non_ascii_before_typed_error_keeps_byte_location() {
-        let error = TomlConfig::new_from_str("hostname = \"节点\"\ndhcp = \"yes\"")
-            .unwrap_err()
-            .to_string();
+        for field in ["dhcp", "dhcpv6"] {
+            let invalid_field = format!("{field} = \"yes\"");
+            let error = TomlConfig::new_from_str(&format!("hostname = \"节点\"\n{invalid_field}"))
+                .unwrap_err()
+                .to_string();
 
-        assert!(error.contains("dhcp = \"yes\""));
-        assert!(error.contains('^'));
-        assert!(error.contains("invalid type: string"));
+            assert!(error.contains(&invalid_field));
+            assert!(error.contains('^'));
+            assert!(error.contains("invalid DHCP CIDR"));
+        }
     }
 
     #[cfg(feature = "rich-config-errors")]
