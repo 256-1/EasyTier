@@ -2075,8 +2075,13 @@ pub async fn wireguard_vpn_portal(#[values(true, false)] test_v6: bool) {
                 config
                     .add_proxy_cidr("198.51.100.0/24".parse().unwrap(), None)
                     .unwrap();
+                let mut flags = config.get_flags();
+                flags.enable_exit_node = true;
+                flags.use_smoltcp = true;
+                config.set_flags(flags);
             }
             if config.get_inst_name() == "inst3" {
+                config.set_exit_nodes(vec!["10.144.144.1".parse().unwrap()]);
                 config.set_vpn_portal_config(VpnPortalConfig {
                     enabled: None,
                     wireguard_listen: "0.0.0.0:22121".parse().unwrap(),
@@ -2137,7 +2142,7 @@ pub async fn wireguard_vpn_portal(#[values(true, false)] test_v6: bool) {
         dst_socket_addr,
         Key::try_from(server_public.as_slice()).unwrap(),
         Key::try_from(client_private.as_slice()).unwrap(),
-        vec!["10.144.144.0/24".to_string()],
+        vec!["10.144.144.0/24".to_string(), "10.1.1.1/32".to_string()],
         "10.144.144.4".to_owned(),
     )
     .unwrap();
@@ -2157,6 +2162,14 @@ pub async fn wireguard_vpn_portal(#[values(true, false)] test_v6: bool) {
     // ping portal node
     wait_for_condition(
         || async { ping_test(network.namespace("net_d"), "10.144.144.3", None).await },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // This address is outside the mesh and advertised proxy CIDRs, on a
+    // separate bridge reachable only through the configured exit node.
+    wait_for_condition(
+        || async { ping_test(network.namespace("net_d"), "10.1.1.1", None).await },
         Duration::from_secs(5),
     )
     .await;
@@ -2838,6 +2851,144 @@ pub async fn foreign_network_functional_cluster() {
     .await;
 
     drop_insts(vec![center_inst1, center_inst2, inst1, inst2]).await;
+}
+
+#[rstest::rstest]
+#[tokio::test]
+#[serial_test::serial]
+async fn foreign_network_advertises_listeners_for_direct_connect(
+    #[values("tcp", "udp")] protocol: &str,
+) {
+    use easytier_proto::{
+        peer_rpc::{DirectConnectorRpc, DirectConnectorRpcClientFactory, GetIpListRequest},
+        rpc_types::controller::BaseController,
+    };
+
+    let mut network = TestNetwork::new();
+    network.create_bridge("br");
+    let process_runtime = CoreProcessRuntime::new();
+    let mut instances = Vec::new();
+    for (index, name) in ["server_a", "server_b", "client_a", "client_b"]
+        .into_iter()
+        .enumerate()
+    {
+        network.create_namespace(
+            name,
+            &format!("10.81.0.{}/24", index + 1),
+            &format!("fd81::{}/64", index + 1),
+        );
+        network.add_to_bridge("br", name);
+        let config = TomlConfigLoader::default();
+        config.set_inst_name(name.to_owned());
+        config.set_netns(Some(network.namespace(name).to_owned()));
+        config.set_network_identity(NetworkIdentity::new(
+            if index < 2 {
+                "public-net"
+            } else {
+                "client-net"
+            }
+            .to_owned(),
+            String::new(),
+        ));
+        config.set_listeners(if index < 2 {
+            // Keep listener discovery independent of interface collection in netns.
+            vec![
+                format!("{protocol}://10.81.0.{}:11010", index + 1)
+                    .parse()
+                    .unwrap(),
+            ]
+        } else {
+            Vec::new()
+        });
+        let mut flags = config.get_flags();
+        flags.no_tun = true;
+        flags.enable_ipv6 = false;
+        flags.disable_udp_hole_punching = true;
+        flags.disable_tcp_hole_punching = true;
+        flags.relay_all_peer_rpc = true;
+        if index == 1 {
+            // The second server only relays RPC, as in the reported topology.
+            flags.relay_network_whitelist = String::new();
+            flags.disable_relay_data = true;
+        }
+        config.set_flags(flags);
+        assert!(config.get_mapped_listeners().is_empty());
+        let mut instance = Instance::new_with_process_runtime(config, process_runtime.clone());
+        instance.run().await.unwrap();
+        set_foreign_network_refresh_interval(&instance, 1).await;
+        instances.push(instance);
+    }
+    let [server_a, server_b, client_a, client_b] = instances.as_slice() else {
+        unreachable!()
+    };
+    // Bootstrap only the cluster link and each client's local server.
+    // Connections to the other server must use its advertised TCP/UDP listener.
+    server_a.add_connector_url(server_b.ring_listener_url());
+    client_a.add_connector_url(server_a.ring_listener_url());
+    client_b.add_connector_url(server_b.ring_listener_url());
+
+    for (client, remote_server) in [(client_a, server_b), (client_b, server_a)] {
+        let client = client.get_core_instance();
+        let remote_server = remote_server.get_core_instance();
+        wait_for_condition(
+            || async {
+                remote_server
+                    .foreign_network_snapshots(false)
+                    .await
+                    .contains_key("client-net")
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+        let remote_peer_id = remote_server.foreign_network_snapshots(false).await["client-net"]
+            .my_peer_id_for_this_network;
+        wait_for_condition(
+            || async {
+                client
+                    .route_snapshots()
+                    .await
+                    .iter()
+                    .any(|route| route.peer_id == remote_peer_id)
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+        let rpc = client
+            .peer_manager()
+            .get_peer_rpc_mgr()
+            .rpc_client()
+            .scoped_client::<DirectConnectorRpcClientFactory<BaseController>>(
+            client.peer_id(),
+            remote_peer_id,
+            "client-net".to_owned(),
+        );
+        let listeners = rpc
+            .get_ip_list(BaseController::default(), GetIpListRequest {})
+            .await
+            .unwrap()
+            .listeners
+            .into_iter()
+            .map(url::Url::from)
+            .collect::<Vec<_>>();
+        assert_eq!(listeners, remote_server.running_listeners());
+        wait_for_condition(
+            || async {
+                client.peer_snapshots().await.iter().any(|peer| {
+                    peer.peer_id == remote_peer_id
+                        && peer.conns.iter().any(|conn| {
+                            conn.is_client
+                                && conn
+                                    .tunnel
+                                    .as_ref()
+                                    .is_some_and(|tunnel| tunnel.tunnel_type == protocol)
+                        })
+                })
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+    }
+    drop_insts(instances).await;
 }
 
 #[rstest::rstest]
@@ -5400,14 +5551,45 @@ pub async fn dhcpv6_three_node_connectivity(#[case] dhcp_ipv4: bool, #[case] sta
     for address in &addresses {
         assert_eq!(address.network(), "fd42:1234::/64".parse().unwrap());
     }
+    // DHCP can temporarily assign the same IPv4 address to multiple peers.
+    // Wait for conflict resolution and route propagation in both directions
+    // before opening connections; IPv6 readiness alone does not imply this.
     wait_for_condition(
         || async {
-            insts[0]
-                .get_core_instance()
-                .route_snapshots()
-                .await
+            let ipv4_addresses = insts
                 .iter()
-                .all(|route| route.ipv6_addr.is_some())
+                .map(|inst| inst.get_global_ctx().get_ipv4())
+                .collect::<Vec<_>>();
+            if (dhcp_ipv4 || static_ipv4)
+                && ipv4_addresses
+                    .iter()
+                    .flatten()
+                    .map(|address| address.address())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    != insts.len()
+            {
+                return false;
+            }
+            for inst in &insts {
+                let routes = inst.get_core_instance().route_snapshots().await;
+                if routes.len() != insts.len() - 1 {
+                    return false;
+                }
+                for (index, peer) in insts.iter().enumerate() {
+                    if peer.peer_id() == inst.peer_id() {
+                        continue;
+                    }
+                    if !routes.iter().any(|route| {
+                        route.peer_id == peer.peer_id()
+                            && route.ipv6_addr == Some(addresses[index].into())
+                            && route.ipv4_addr == ipv4_addresses[index].map(Into::into)
+                    }) {
+                        return false;
+                    }
+                }
+            }
+            true
         },
         Duration::from_secs(15),
     )

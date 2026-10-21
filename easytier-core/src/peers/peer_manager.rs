@@ -1336,6 +1336,16 @@ impl PeerManagerCore {
         &self,
         config: CoreInstanceRuntimeConfig,
     ) -> anyhow::Result<Arc<CoreInstanceRuntimeConfig>> {
+        self.update_runtime_config_with(config, || ())
+            .await
+            .map(|(published, ())| published)
+    }
+
+    pub(crate) async fn update_runtime_config_with<T>(
+        &self,
+        config: CoreInstanceRuntimeConfig,
+        before_publish: impl FnOnce() -> T,
+    ) -> anyhow::Result<(Arc<CoreInstanceRuntimeConfig>, T)> {
         let _update = self.runtime_config_update.lock().await;
         let current = self.runtime_config.snapshot();
         let refresh_acl_groups = current.peer.peer_group_memberships
@@ -1345,6 +1355,9 @@ impl PeerManagerCore {
         let next_acl = reload_acl.then(|| config.services.acl.clone());
         let next_built_acl = next_acl.as_ref().map(AclRuleConfig::build).transpose()?;
 
+        // Commit prepared host resources only after all fallible validation,
+        // with no cancellation point before publishing their configuration.
+        let committed = before_publish();
         self.set_avoid_relay_data_preference(config.peer.avoid_relay_data_preference);
         let published = self
             .runtime_config
@@ -1357,7 +1370,7 @@ impl PeerManagerCore {
         if refresh_acl_groups {
             self.route.refresh_acl_groups().await;
         }
-        Ok(published)
+        Ok((published, committed))
     }
 
     /// Keeps this manager's ACL rules and group assignments aligned with a
@@ -1754,6 +1767,13 @@ impl PeerManagerCore {
 
     pub async fn update_exit_nodes(&self, exit_nodes: Vec<IpAddr>) {
         *self.exit_nodes.write().await = exit_nodes;
+    }
+
+    /// Shares the network's current exit nodes, including later updates, while
+    /// keeping this peer's route lookup and packet identity independent.
+    pub(super) fn inherit_exit_nodes(&mut self, network: &Self) {
+        self.exit_nodes = network.exit_nodes.clone();
+        self.outbound_packet_router.exit_nodes = self.exit_nodes.clone();
     }
 
     fn reload_acl(&self, acl: Option<&crate::proto::acl::Acl>) {
